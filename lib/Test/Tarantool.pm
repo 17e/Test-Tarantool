@@ -19,7 +19,7 @@ Version 0.01
 =cut
 
 our $VERSION = '0.01';
-our $Count;
+our $Count = 0;
 our %Schedule;
 
 =head1 SYNOPSIS
@@ -35,7 +35,12 @@ our %Schedule;
 
     @cluster = map { [ $_->{host}, $_->{p_port} ] } @shards;
 
-    $_->start for (@shards);
+    {
+        my $cv = AE::cv();
+        $cv->begin for (@shards);
+        $_->start($cv) for (@shards);
+        $cv->recv;
+    }
 
     $shards[0]->ro();
 
@@ -51,35 +56,77 @@ our %Schedule;
     # stop tarantools and clear work directoies
     @shards = ();
 
-=head1 EXPORT
-
-A list of functions that can be exported.  You can delete this section
-if you don't export anything, such as for a purely object-oriented module.
-
 =head1 SUBROUTINES/METHODS
 
 =head2 new
+
+Create new Tarantool instance
+
+Optional arguments:
+
+=over 8
+
+=item arena
+
+The maximal size of tarantool arenain Gb
+Default: 0.1
+
+=item cleanup
+
+Remove tarantool work directory after garbage collection
+Default: 1
+
+=item initlua
+
+Content of init.lua file
+
+=item host
+
+Host bind to
+
+=item port
+
+Primary port number, base for s_port, a_port and r_port.
+Default: 6603 + <tarantool number>
+
+=item root
+
+Tarantool work directory
+Default: ./tnt_<10 random uppercase letters>
+
+=item title
+
+Part of process name (custom_proc_title)
+Default: "yat<tarantool number>"
+
+=item wal_mode
+
+The WAL write mode. See the desctiption of wal_mode tarantool variable.
+Default: none
+
+=back
 
 =cut
 
 sub new {
 	my $class = shift; $class = (ref $class)? ref $class : $class;
-	$Count++;
 	my $self = {
-		title => "yat" . $Count,
-		root => join("", ("tnt_", map { chr(97 + int(rand(26))) } 1..10)),
 		arena => 0.1,
-		port => 6603 + 4 * $Count, # FIXME: need feeting
-		host => '127.0.0.1',
-		wal_mode => 'none',
-		log_level => 5,
+		cleanup => 1,
 		initlua => '-- init.lua --',
-		replication_source => '',
-		logger => sub { warn delete $_[0]->{rbuf} },
+		host => '127.0.0.1',
+		log_level => 5,
+		logger => sub { warn $_[0] },
 		on_die => sub { warn "Broken pipe, child is dead?"; },
+		port => 6603 + 4 * $Count, # FIXME: auto fitting needed
+		replication_source => '',
+		root => join("", ("tnt_", map { chr(97 + int(rand(26))) } 1..10)),
+		snapshot => '',
+		title => "yat" . $Count,
+		wal_mode => 'none',
 		@_,
-	};
-	$self->{p_port} ||= $self->{port};
+	}; $Count++;
+	$self->{p_port} = $self->{port};
 	$self->{s_port} ||= $self->{port} + 1;
 	$self->{a_port} ||= $self->{port} + 2;
 	$self->{r_port} ||= $self->{port} + 3;
@@ -102,28 +149,68 @@ sub new {
 
 sub start {
 	my $self = shift;
+	my $cb = pop;
+	my %arg = (
+		timeout => 60,
+		@_
+	);
+
+	return $cb->(0, 'Already running') if($self->{pid});
 
 	pipe my $cr, my $pw or die "pipe filed: $!";
 	pipe my $pr, my $cw or die "pipe filed: $!";
 	autoflush($_) for ($pr, $pw, $cr, $cw);
 
-	defined(my $pid = fork) or die "Can't fork: $!";
+	return $cb->(0, "Can't fork: $!") unless defined(my $pid = fork);
 	if ($pid) {
 		close($_) for ($cr, $cw);
 		$self->{pid} = $pid;
 		$self->{rpipe} = $pr;
 		$self->{wpipe} = $pw;
+		$self->{nanny} = AnyEvent->child(
+			pid => $pid,
+			cb => sub {
+				$self->{$_} = undef for qw/pid asleep rpipe wpipe nanny/;
+				# call on_die only for unexpected termination
+				if($self->{dying}) {
+					delete $self->{dying};
+				} else {
+					$self->{on_die}->($self, @_);
+				}
+			});
 		$self->{rh} = AnyEvent::Handle->new(
 			fh => $pr,
-			on_read => $self->{logger},
-			on_error => sub { $self->{pid} = $self->{replication_source} = $self->{sleep} = undef; $self->{on_die}->($self, @_); },
+			on_read => sub { $self->{logger}->(delete $_[0]->{rbuf}) },
+			on_error => sub {
+				kill 9, $self->{pid} if ($self->{pid} and kill 0, $self->{pid});
+			},
+		);
+		my $i = int($arg{timeout} / 0.1);
+		$self->{start_timer} = AnyEvent->timer(
+			after => 0.01,
+			interval => 0.1,
+			cb => sub {
+				open my $fh, "<", "/proc/$self->{pid}/cmdline" or
+					do { $self->{start_timer} = undef; return $cb->(0, "Tarantool died"); };
+				my $status = $self->{replication_source} ? "replica" : "primary";
+				if (<$fh> =~ /$status/) {
+					$self->{start_timer} = undef;
+					$cb->(1, "OK");
+				}
+				unless($i > 0) {
+					warn "\n";
+					kill TERM => $self->{pid};
+					$self->{start_timer} = undef;
+					$cb->(0, "Timeout exceeding. Process terminated");
+				}
+				$i--;
+			}
 		);
 	} else {
 		close($_) for ($pr, $pw);
 		open(STDIN, "<&", $cr) or die "Could not dup filehandle: $!";
 		open(STDOUT, ">&", $cw) or die "Could not dup filehandle: $!";
 		open(STDERR, ">&", $cw) or die "Could not dup filehandle: $!";
-		print "$self->{root}/tarantool.conf";
 		exec "tarantool_box -v -c '$self->{root}/tarantool.conf'";
 		die "exec: $!";
 	}
@@ -135,9 +222,36 @@ sub start {
 
 sub stop {
 	my $self = shift;
-	$self->resume() if delete $self->{sleep};
-	$self->_kill('TERM');
-	delete $self->{pid}
+	my $cb = pop;
+	my %arg = (
+		timeout => 10,
+		@_
+	);
+
+	return unless $self->{pid};
+
+	$self->resume() if delete $self->{asleep};
+
+	$self->{dying} = 1;
+
+	my $i = int($arg{timeout} / 0.1);
+	$self->{stop_timer} = AnyEvent->timer(
+		interval => 0.1,
+		cb => sub {
+			unless ($self->{pid}) {
+				$self->{stop_timer} = undef;
+				$cb->(1, "OK");
+			}
+
+			unless($i > 0) {
+				$self->{stop_timer} = undef;
+				kill KILL => $self->{pid};
+				$cb->(0, "Killed");
+			}
+			$i--;
+		}
+	);
+	kill TERM => $self->{pid};
 }
 
 =head2 pause
@@ -146,7 +260,9 @@ sub stop {
 
 sub pause {
 	my $self = shift;
-	$self->{sleep} = $self->_kill('STOP') unless $self->{sleep}
+	return unless $self->{pid};
+	$self->{asleep} = 1;
+	kill STOP => $self->{pid};
 }
 
 =head2 resume
@@ -155,7 +271,9 @@ sub pause {
 
 sub resume {
 	my $self = shift;
-	$self->_kill('CONT') if delete $self->{sleep};
+	return unless $self->{pid};
+	$self->{asleep} = undef;
+	kill CONT => $self->{pid};
 }
 
 =head2 ro
@@ -229,12 +347,15 @@ sub admin_cmd {
 	);
 }
 
-sub _kill {
-	my ($self, $signal) = @_;
-	return unless ($self->{pid});
-	local $_ = kill 0, $self->{pid};
-	return $_ unless ($signal and $_);
-	kill $signal, $self->{pid} if $signal;
+=head2 times
+
+=cut
+
+sub times {
+	my $self = shift;
+	return unless $self->{pid};
+	open my $f, "<", "/proc/$self->{pid}/stat";
+	map { $_ / 100 } (split " ", <$f>)[13..14];
 }
 
 sub _config {
@@ -263,18 +384,24 @@ sub _init_storage() {
 	my $self = shift;
 	open my $f, '>', $self->{root} . '/' . '00000000000000000001.snap' or die "Could not create tnt snap: $!";
 	syswrite $f, "\x53\x4e\x41\x50\x0a\x30\x2e\x31\x31\x0a\x0a\x1e\xab\xad\x10";
+	if ($self->{snapshot} =~ m{(?:^|/)([0-9]{20}\.snap)$}) {
+		use Cwd;
+		symlink Cwd::abs_path($self->{snapshot}), $self->{root} . '/' . $1;
+	}
 }
 
 sub DESTROY {
 	my $self = shift;
 	return unless $Schedule{$self};
-	$self->stop();
-	opendir my $root, $self->{root} or die "opendir: $!";
-	my @unlink = map { (/^[^.]/ && -f "$self->{root}/$_") ? "$self->{root}/$_" : () } readdir($root);
-	local $, = ' ';
-	unlink @unlink or
-		warn "Could not unlink files (@unlink): $!";
-	rmdir($self->{root});
+	kill TERM => $self->{pid} if $self->{pid};
+	if ($self->{cleanup}) {
+		opendir my $root, $self->{root} or die "opendir: $!";
+		my @unlink = map { (/^[^.]/ && -f "$self->{root}/$_") ? "$self->{root}/$_" : () } readdir($root);
+		local $, = ' ';
+		unlink @unlink or
+			warn "Could not unlink files (@unlink): $!";
+		rmdir($self->{root});
+	}
 	delete $Schedule{$self};
 	warn "$self->{title} destroed\n";
 }
@@ -351,7 +478,7 @@ admin_port = %{a_port}
 replication_port = %{r_port}
 %{{ "replication_source = %{replication_source}" if "%{replication_source}" }}
 
-script_dir = %{root}
+script_dir = .
 work_dir = %{root}
 wal_mode = %{wal_mode}
 log_level = %{log_level}

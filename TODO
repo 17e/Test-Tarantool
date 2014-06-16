@@ -1,0 +1,4 @@
+* Definition spaces via string, some struct, file or sub (?)
+    Only string supported in current version
+* Definition init.lua via string, file or sub (?)
+    Only string supported in current version
