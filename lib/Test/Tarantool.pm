@@ -10,30 +10,48 @@ use Data::Dumper;
 
 =head1 NAME
 
-Test::Tarantool - The Swiss army knife for testing of Tarantool related Perl code.
+Test::Tarantool - The Swiss army knife for tests of Tarantool related Perl and lua code.
 
 =head1 VERSION
 
-Version 0.01
+Version 0.03
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.03';
 our $Count = 0;
 our %Schedule;
 
 =head1 SYNOPSIS
 
     use Test::Tarantool;
+    use AnyEvent;
+
+    # Clear data and exit on Ctrl+C.
+    my $w = AnyEvent->signal (signal => "INT", cb => sub { exit 0 });
 
     my @shards = map {
-        my $shardTest::Tarantool->new(
-            spaces => do { open my $f, '<', 'spaces.conf'; local $/ = undef; return <$f>},
-            initlua => do { open my $f, '<', 'init.lua'; local $/ = undef; return <$f>},
+        my $n = $_;
+        Test::Tarantool->new(
+            host => '127.17.3.0',
+            spaces => 'space[0] = {
+                           enabled = 1,
+                           index = [ {
+                               type = HASH,
+                               unique = 1,
+                               key_field = [ { fieldno = 0, type = STR }, ],
+                           }, ],
+                       }',
+            initlua => do {
+                          open my $f, '<', 'init.lua';
+                          local $/ = undef;
+                          <$f> or "";
+                       },
+            on_die => sub { warn "Shard #$n unexpectedly terminated\n"; exit; },
         );
-    } 1..4
+    } 1..4;
 
-    @cluster = map { [ $_->{host}, $_->{p_port} ] } @shards;
+    my @cluster = map { [ $_->{host}, $_->{p_port} ] } @shards;
 
     {
         my $cv = AE::cv();
@@ -42,7 +60,15 @@ our %Schedule;
         $cv->recv;
     }
 
-    $shards[0]->ro();
+    {
+        $_->sync_start() for (@shards);
+    }
+
+    {
+        my ($status, $reason) = $shards[0]->sync_ro();
+        die $reason unless $status;
+        print (($shards[0]->sync_admin_cmd("show info"))[1]);
+    }
 
     # Some test case here
 
@@ -51,58 +77,95 @@ our %Schedule;
     # Some test case here
 
     $shards[1]->resume();
-    $shards[0]->rw();
+
+    {
+        my ($status, $reason) = $shards[0]->sync_rw();
+        die $reason unless $status;
+        print (($shards[0]->sync_admin_cmd("show info"))[1]);
+    }
 
     # stop tarantools and clear work directoies
     @shards = ();
 
 =head1 SUBROUTINES/METHODS
 
-=head2 new
+=head2 new option => value,...
 
-Create new Tarantool instance
+Create new Tarantool instance. Every call of new method increase counter, below
+called as I<tarantool number> or I<tn>.
 
-Optional arguments:
+=over 4
 
-=over 8
+=item root => $path
 
-=item arena
+Tarantool work directory. Default is I<./tnt_E<lt>10_random_lowercase_lettersE<gt>>
 
-The maximal size of tarantool arenain Gb
-Default: 0.1
+=item arena => $size
 
-=item cleanup
+The maximal size of tarantool arena in Gb. Default is I<0.1>
 
-Remove tarantool work directory after garbage collection
-Default: 1
+=item cleanup => $bool
 
-=item initlua
+Remove tarantool work directory after garbage collection. Default is I<1>
 
-Content of init.lua file
+=item spaces => $string
 
-=item host
+Tarantool spaces description. This is only one B<required> argument.
 
-Host bind to
+=item initlua => $content
 
-=item port
+Content of init.lua file. Be default an empty file created.
 
-Primary port number, base for s_port, a_port and r_port.
-Default: 6603 + <tarantool number>
+=item host => $address
 
-=item root
+Address bind to. Default: I<127.0.0.1>
 
-Tarantool work directory
-Default: ./tnt_<10 random uppercase letters>
+=item port => $port
 
-=item title
+Primary port number, base for s_port, a_port and r_port. Default is I<6603+E<lt>tnE<gt>*4>
 
-Part of process name (custom_proc_title)
-Default: "yat<tarantool number>"
+=item s_port => $port
 
-=item wal_mode
+Read-only (secondary) port. Default is I<port+1>
 
-The WAL write mode. See the desctiption of wal_mode tarantool variable.
-Default: none
+=item a_port => $port
+
+Admin port. Default is I<port+2>
+
+=item r_port => $port
+
+Replication port. Default is I<port+3>
+
+=item title => $title
+
+Part of process name (custom_proc_title) Default is I<"yatE<lt>tnE<lt>">
+
+=item wal_mode => $mode
+
+The WAL write mode. See the desctiption of wal_mode tarantool variable. Default
+is I<none>. Look more about wal_mode in tarantool documentation.
+
+=item log_level => $number
+
+Tarantool log level. Default is I<5>
+
+=item snapshot => $path
+
+Path to some snapshot. If given the symbolic link to it will been created in
+tarantool work directory.
+
+=item replication_source => $string
+
+If given the server is considered to be a Tarantool replica.
+
+=item logger => $sub
+
+An subroutine called at every time, when tarantool write some thing in a log.
+The writed text passed as the first argument. Default is warn.
+
+=item on_die => $sub
+
+An subroutine called on a unexpected tarantool termination.
 
 =back
 
@@ -110,6 +173,7 @@ Default: none
 
 sub new {
 	my $class = shift; $class = (ref $class)? ref $class : $class;
+	# FIXME: must die if no spaces given
 	my $self = {
 		arena => 0.1,
 		cleanup => 1,
@@ -143,7 +207,18 @@ sub new {
 	$self;
 }
 
-=head2 start
+=head2 start option => $value, $cb->($status, $reason)
+
+Run tarantool instance.
+
+=over 4
+
+=item timeout => $timeout
+
+If not After $timeout seconds tarantool will been kelled by the KILL signal if
+not started.
+
+=back
 
 =cut
 
@@ -190,6 +265,10 @@ sub start {
 			after => 0.01,
 			interval => 0.1,
 			cb => sub {
+				unless ($self->{pid}) {
+					$self->{start_timer} = undef;
+					$cb->(0, "Process unexpectedly terminated");
+				}
 				open my $fh, "<", "/proc/$self->{pid}/cmdline" or
 					do { $self->{start_timer} = undef; return $cb->(0, "Tarantool died"); };
 				my $status = $self->{replication_source} ? "replica" : "primary";
@@ -198,7 +277,6 @@ sub start {
 					$cb->(1, "OK");
 				}
 				unless($i > 0) {
-					warn "\n";
 					kill TERM => $self->{pid};
 					$self->{start_timer} = undef;
 					$cb->(0, "Timeout exceeding. Process terminated");
@@ -208,15 +286,26 @@ sub start {
 		);
 	} else {
 		close($_) for ($pr, $pw);
+		chdir $self->{root};
 		open(STDIN, "<&", $cr) or die "Could not dup filehandle: $!";
 		open(STDOUT, ">&", $cw) or die "Could not dup filehandle: $!";
 		open(STDERR, ">&", $cw) or die "Could not dup filehandle: $!";
-		exec "tarantool_box -v -c '$self->{root}/tarantool.conf'";
+		exec "tarantool_box -v -c tarantool.conf";
 		die "exec: $!";
 	}
 }
 
-=head2 stop
+=head2 stop option => $value, $cb->($status, $reason)
+
+stop tarantool instance
+
+=over 4
+
+=item timeout => $timeout
+
+After $timeout seconds tarantool will been kelled by the KILL signal
+
+=back
 
 =cut
 
@@ -228,7 +317,7 @@ sub stop {
 		@_
 	);
 
-	return unless $self->{pid};
+	return $cb->(1, "Not Running") unless $self->{pid};
 
 	$self->resume() if delete $self->{asleep};
 
@@ -256,6 +345,8 @@ sub stop {
 
 =head2 pause
 
+Send STOP signal to instance
+
 =cut
 
 sub pause {
@@ -267,6 +358,8 @@ sub pause {
 
 =head2 resume
 
+Send CONT signal to instance
+
 =cut
 
 sub resume {
@@ -276,43 +369,41 @@ sub resume {
 	kill CONT => $self->{pid};
 }
 
-=head2 ro
+=head2 ro $cb->($status, $reason)
+
+Switch tarantool instance to read only mode.
 
 =cut
 
 sub ro {
 	my ($self, $cb) = @_;
-	return if $self->{replication_source};
+	return $cb->(1, "Not Changed") if $self->{replication_source};
 	$self->{replication_source} = "$self->{host}:$self->{port}";
 	$self->_config();
 	$self->admin_cmd("reload configuration", sub {
-		if (ref $cb eq 'CODE') {
-			$cb->($@)
-		} else {
-			warn "$self->{title}: reload configuration => " . ($_[0] ? "OK" : "Failed")
-		}
+		$cb->($_[0], $_[0] ? "OK" : "Failed")
 	});
 }
 
-=head2 rw
+=head2 rw $cb->($status, $reason)
+
+Switch tarantool instance to write mode.
 
 =cut
 
 sub rw {
 	my ($self, $cb) = @_;
-	return unless $self->{replication_source};
+	return $cb->(1, "Not Changed") unless $self->{replication_source};
 	$self->{replication_source} = "";
 	$self->_config();
 	$self->admin_cmd("reload configuration", sub {
-		if (ref $cb eq 'CODE') {
-			$cb->($@)
-		} else {
-			warn "$self->{title}: reload configuration => " . ($_[0] ? "OK" : "Failed")
-		}
+		$cb->($_[0], $_[0] ? "OK" : "Failed")
 	});
 }
 
-=head2 admin_cmd
+=head2 admin_cmd $cmd, $cb->($status, $response_or_reason)
+
+Exec a command via the amind port.
 
 =cut
 
@@ -331,13 +422,6 @@ sub admin_cmd {
 			delete $self->{afh};
 			$cb->(0, $_[1]);
 		},
-		on_read => sub {
-			my $response = $_[0]->{rbuf};
-			$_[0]->on_read(undef);
-			$_[0]->destroy();
-			delete $self->{afh};
-			$cb->(1, $response);
-		},
 		on_error => sub {
 			$_[0]->on_read(undef);
 			$_[0]->destroy();
@@ -345,9 +429,16 @@ sub admin_cmd {
 			$cb->(0, $_[2])
 		},
 	);
+	$self->{afh}->push_read(regex => qr/\x0a\.\.\.\x0a/, sub {
+		$_[0]->destroy();
+		delete $self->{afh};
+		$cb->(1, $_[1]);
+	});
 }
 
 =head2 times
+
+Return values of utime and stime from /proc/[pid]/stat, converted to seconds
 
 =cut
 
@@ -357,6 +448,26 @@ sub times {
 	open my $f, "<", "/proc/$self->{pid}/stat";
 	map { $_ / 100 } (split " ", <$f>)[13..14];
 }
+
+=head2 sync_start sync_stop sync_ro sync_rw sync_admin_cmd
+
+Aliases for start, stop, ro, rw, admin_cmd respectively, arguments a similar,
+but cb not passed.
+
+=cut
+
+{
+	no strict 'refs';
+	for my $method (qw/start stop ro rw admin_cmd/) {
+		*{"Test::Tarantool::sync_$method"} = sub {
+			my $self = shift;
+			my $cv = AE::cv();
+			$self->$method(@_, $cv);
+			return $cv->recv;
+		}
+	}
+}
+
 
 sub _config {
 	my $self = shift;
@@ -412,10 +523,9 @@ END {
 	}
 }
 
-
 =head1 AUTHOR
 
-Anton Reznikov, C<< <a.reznikov at corp.mail.ru> >>
+Anton Reznikov, C<< <anton.n.reznikov at gmail.com> >>
 
 =head1 BUGS
 
@@ -429,39 +539,15 @@ You can find documentation for this module with the perldoc command.
 
     perldoc Test::Tarantool
 
-
-You can also look for information at:
-
-=over 4
-
-=item * RT: CPAN's request tracker (report bugs here)
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Test-Tarantool>
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/Test-Tarantool>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/Test-Tarantool>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/Test-Tarantool/>
-
-=back
-
-
 =head1 ACKNOWLEDGEMENTS
 
+    Mons Anderson    - The original idia of the module.
 
 =head1 LICENSE AND COPYRIGHT
 
 Copyright 2014 Anton Reznikov.
 
 This program is released under the following license: GPL
-
 
 =cut
 
@@ -479,7 +565,7 @@ replication_port = %{r_port}
 %{{ "replication_source = %{replication_source}" if "%{replication_source}" }}
 
 script_dir = .
-work_dir = %{root}
+work_dir = .
 wal_mode = %{wal_mode}
 log_level = %{log_level}
 #logger = "cat - >> tarantool.log"
