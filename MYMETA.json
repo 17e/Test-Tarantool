@@ -1,10 +1,10 @@
 {
-   "abstract" : "The great new Test::Tarantool!",
+   "abstract" : "The Swiss army knife for tests of Tarantool related Perl and lua code.",
    "author" : [
       "Anton Reznikov <a.reznikov@corp.mail.ru>"
    ],
    "dynamic_config" : 0,
-   "generated_by" : "ExtUtils::MakeMaker version 6.72, CPAN::Meta::Converter version 2.132661",
+   "generated_by" : "ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.120921",
    "license" : [
       "open_source"
    ],
@@ -37,5 +37,5 @@
       }
    },
    "release_status" : "stable",
-   "version" : "0.01"
+   "version" : "0.03"
 }
